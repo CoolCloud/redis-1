@@ -57,20 +57,12 @@ void freeReplicationBacklog(void) {
     zfree(server.repl_backlog);
 }
 
-/* Add data to the replication backlog. This function expects that the
- * server.master_repl_offset was already incremented before calling it. */
-void feedReplicationBacklog(robj *o) {
-    char llstr[REDIS_LONGSTR_SIZE];
-    char *p;
-    size_t len;
-
-    if (o->encoding == REDIS_ENCODING_RAW) {
-        len = ll2string(llstr,sizeof(llstr),(long)o->ptr);
-        p = llstr;
-    } else {
-        len = sdslen(o->ptr);
-        p = o->ptr;
-    }
+/* Add data to the replication backlog.
+ * This function also increments the global replication offset stored at
+ * server.master_repl_offset, because there is no case where we want to feed
+ * the backlog without incrementing the buffer. */
+void feedReplicationBacklog(void *p, size_t len) {
+    server.master_repl_offset += len;
 
     /* This is a circular buffer, so write as much data we can at every
      * iteration and rewind the "idx" index if we reach the limit. */
@@ -89,6 +81,23 @@ void feedReplicationBacklog(robj *o) {
     /* Set the offset of the first byte we have in the backlog. */
     server.repl_backlog_off = server.master_repl_offset -
                               server.repl_backlog_histlen + 1;
+}
+
+/* Wrapper for feedReplicationBacklog() that takes Redis string objects
+ * as input. */
+void feedReplicationBacklogWithObject(robj *o) {
+    char llstr[REDIS_LONGSTR_SIZE];
+    void *p;
+    size_t len;
+
+    if (o->encoding == REDIS_ENCODING_RAW) {
+        len = ll2string(llstr,sizeof(llstr),(long)o->ptr);
+        p = llstr;
+    } else {
+        len = sdslen(o->ptr);
+        p = o->ptr;
+    }
+    feedReplicationBacklog(p,len);
 }
 
 #define FEEDSLAVE_BUF_SIZE (1024*64)
@@ -194,14 +203,21 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     /* If we have a backlog, populate it with data and increment
      * the global replication offset. */
     if (server.repl_backlog) {
-        server.master_repl_offset += b-buf;
-        feedReplicationBacklog(o);
+        feedReplicationBacklogWithObject(o);
         for (i = j; i < argc; i++) {
-            /* !!! TODO BUG !!!
-             * Here we need to use the bulk reply, not the object itself.
-             * So let's add $....\r\n and the final \r\n. */
-            server.master_repl_offset += stringObjectLen(argv[i]);
-            feedReplicationBacklog(argv[j]);
+            char aux[REDIS_LONGSTR_SIZE+3];
+            long objlen = stringObjectLen(argv[i]);
+
+            /* We need to feed the buffer with the object as a bulk reply
+             * not just as a plain string, so create the $..CRLF payload len 
+             * ad add the final CRLF */
+            aux[0] = '$';
+            len = ll2string(aux+1,objlen,sizeof(aux)-1);
+            aux[len+1] = '\r';
+            aux[len+2] = '\n';
+            feedReplicationBacklog(aux,len+3);
+            feedReplicationBacklogWithObject(argv[j]);
+            feedReplicationBacklogWithObject(shared.crlf);
         }
     }
 
