@@ -37,6 +37,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
+void replicationDiscardCachedMaster(void);
+
 /* ---------------------------------- MASTER -------------------------------- */
 
 void createReplicationBacklog(void) {
@@ -290,8 +292,48 @@ void replicationFeedMonitors(redisClient *c, list *monitors, int dictid, robj **
     decrRefCount(cmdobj);
 }
 
+/* Try a partial resynchronization. On success return REDIS_OK, otherwise
+ * REDIS_ERR is returned and we proceed with the usual full resync. */
+int tryPartialResynchronization(redisClient *c) {
+    long long psync_offset;
+    robj *master_runid = c->argv[2];
+
+    /* Is the runid of this master the same advertised by the wannabe slave
+     * via PSYNC? If runid changed this master is a different instance and
+     * there is no way to continue. */
+    if (strcasecmp(master_runid->ptr,server.runid)) goto need_full_resync;
+    /* We still have the data our slave is asking for? */
+    if (getLongLongFromObjectOrReply(c,c->argv[2],&psync_offset,NULL) !=
+       REDIS_OK) goto need_full_resync;
+    if (!server.repl_backlog ||
+        psync_offset < server.repl_backlog_off ||
+        psync_offset >= (server.repl_backlog_off + server.repl_backlog_size))
+        goto need_full_resync;
+    /* If we reached this point, we are able to perform a partial resync:
+     * 1) Set client state to make it a slave.
+     * 2) Inform the client we can continue with +CONTINUE
+     * 3) Send the backlog data (from the offset to the end) to the slave. */
+    c->flags |= REDIS_SLAVE;
+    c->replstate = REDIS_REPL_ONLINE;
+    listAddNodeTail(server.slaves,c);
+    /* Note that we don't need to set the selected DB at server.slaveseldb
+     * to -1 to force the master to emit SELECT, since the slave already
+     * has this state from the previous connection with the master. */
+
+    return REDIS_OK; /* The caller can return, no full resync needed. */
+
+need_full_resync:
+    /* We need a full resync for some reason... notify the client. */
+    addReplySds(c,
+        sdscatprintf(sdsempty(),"+FULLRESYNC %s %lld\r\n",
+        server.runid,
+        server.master_repl_offset));
+    return REDIS_ERR;
+}
+
+/* SYNC ad PSYNC command implemenation. */
 void syncCommand(redisClient *c) {
-    /* ignore SYNC if aleady slave or in monitor mode */
+    /* ignore SYNC if aleady slave or in monitor mode. */
     if (c->flags & REDIS_SLAVE) return;
 
     /* Refuse SYNC requests if we are a slave but the link with our master
@@ -306,11 +348,23 @@ void syncCommand(redisClient *c) {
      * buffer registering the differences between the BGSAVE and the current
      * dataset, so that we can copy to other slaves if needed. */
     if (listLength(c->reply) != 0) {
-        addReplyError(c,"SYNC is invalid with pending input");
+        addReplyError(c,"SYNC and PSYNC are invalid with pending input");
         return;
     }
 
     redisLog(REDIS_NOTICE,"Slave ask for synchronization");
+
+    /* Try a partial resynchronization if this is a PSYNC command.
+     * If it fails, we continue with usual full resynchronization, however
+     * when this happens tryPartialResynchronization() already replied with:
+     *
+     * +FULLRESYNC <runid> <offset>
+     *
+     * So the slave knows the new runid and offset to try a PSYNC later
+     * if the connection with the master is lost. */
+    if (!strcasecmp(c->argv[0]->ptr,"psync") &&
+        tryPartialResynchronization(c) == REDIS_OK) return;
+
     /* Here we need to check if there is a background saving operation
      * in progress, or if it is required to start one */
     if (server.rdb_child_pid != -1) {

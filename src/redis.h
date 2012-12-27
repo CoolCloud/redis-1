@@ -1046,6 +1046,8 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
 void replicationFeedMonitors(redisClient *c, list *monitors, int dictid, robj **argv, int argc);
 void updateSlavesWaitingBgsave(int bgsaveerr);
 void replicationCron(void);
+void replicationHandleMasterDisconnection(void);
+void replicationCacheMaster(redisClient *c);
 
 /* Generic persistence functions */
 void startLoading(FILE *fp);
