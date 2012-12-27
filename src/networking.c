@@ -84,6 +84,7 @@ redisClient *createClient(int fd) {
     c->ctime = c->lastinteraction = server.unixtime;
     c->authenticated = 0;
     c->replstate = REDIS_REPL_NONE;
+    c->reploff = 0;
     c->slave_listening_port = 0;
     c->reply = listCreate();
     c->reply_bytes = 0;
@@ -590,8 +591,29 @@ void disconnectSlaves(void) {
     }
 }
 
+/* This function is called when the slave lose the connection with the
+ * master into an unexpected way. */
+void replicationHandleMasterDisconnection(void) {
+    server.master = NULL;
+    server.repl_state = REDIS_REPL_CONNECT;
+    server.repl_down_since = server.unixtime;
+    /* We lost connection with our master, force our slaves to resync
+     * with us as well to load the new data set.
+     *
+     * If server.masterhost is NULL the user called SLAVEOF NO ONE so
+     * slave resync is not needed. */
+    if (server.masterhost != NULL) disconnectSlaves();
+}
+
 void freeClient(redisClient *c) {
     listNode *ln;
+
+    /* If it is our master that's beging disconnected we should make sure
+     * to cache the state to try a partial resynchronization later. */
+    if (server.master && c->flags & REDIS_MASTER) {
+        replicationCacheMaster(c);
+        return;
+    }
 
     /* If this is marked as current client unset it */
     if (server.current_client == c) server.current_client = NULL;
@@ -615,12 +637,15 @@ void freeClient(redisClient *c) {
     pubsubUnsubscribeAllPatterns(c,0);
     dictRelease(c->pubsub_channels);
     listRelease(c->pubsub_patterns);
-    /* Obvious cleanup */
-    aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
-    aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+    /* Close socket, unregister events, and remove list of replies and
+     * accumulated arguments. */
+    if (c->fd != -1) {
+        aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+        aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+        close(c->fd);
+    }
     listRelease(c->reply);
     freeClientArgv(c);
-    close(c->fd);
     /* Remove from the list of clients */
     ln = listSearchKey(server.clients,c);
     redisAssert(ln != NULL);
@@ -645,17 +670,7 @@ void freeClient(redisClient *c) {
     }
 
     /* Case 2: we lost the connection with the master. */
-    if (c->flags & REDIS_MASTER) {
-        server.master = NULL;
-        server.repl_state = REDIS_REPL_CONNECT;
-        server.repl_down_since = server.unixtime;
-        /* We lost connection with our master, force our slaves to resync
-         * with us as well to load the new data set.
-         *
-         * If server.masterhost is NULL the user called SLAVEOF NO ONE so
-         * slave resync is not needed. */
-        if (server.masterhost != NULL) disconnectSlaves();
-    }
+    if (c->flags & REDIS_MASTER) replicationHandleMasterDisconnection();
 
     /* If this client was scheduled for async freeing we need to remove it
      * from the queue. */

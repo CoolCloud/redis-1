@@ -878,6 +878,7 @@ void slaveofCommand(redisClient *c) {
             sdsfree(server.masterhost);
             server.masterhost = NULL;
             if (server.master) freeClient(server.master);
+            replicationDiscardCachedMaster();
             if (server.repl_state == REDIS_REPL_TRANSFER)
                 replicationAbortSyncTransfer();
             else if (server.repl_state == REDIS_REPL_CONNECTING ||
@@ -906,6 +907,7 @@ void slaveofCommand(redisClient *c) {
         server.masterport = port;
         if (server.master) freeClient(server.master);
         disconnectSlaves(); /* Force our slaves to resync with us as well. */
+        replicationDiscardCachedMaster(); /* Don't try a PSYNC. */
         if (server.repl_state == REDIS_REPL_TRANSFER)
             replicationAbortSyncTransfer();
         server.repl_state = REDIS_REPL_CONNECT;
@@ -913,6 +915,45 @@ void slaveofCommand(redisClient *c) {
             server.masterhost, server.masterport);
     }
     addReply(c,shared.ok);
+}
+
+/* ---------------------- MASTER CACHING FOR PSYNC -------------------------- */
+
+/* In order to implement partial synchronization we need to be able to cache
+ * our master's client structure after a transient disconnection.
+ * It is cached into server.cached_master and flushed away using the following
+ * functions. */
+
+void replicationCacheMaster(redisClient *c) {
+    redisAssert(server.master != NULL && server.cached_master == NULL);
+
+    /* Remove the event handlers and close the socket. We'll later reuse
+     * the socket of the new connection with the master during PSYNC. */
+    aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+    aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+    close(c->fd);
+
+    /* Set fd to -1 so that we can safely call freeClient(c) later. */
+    c->fd = -1;
+
+    /* Caching the master happens instead of the actual freeClient() call,
+     * so make sure to adjust the replication state. */
+    replicationHandleMasterDisconnection();
+}
+
+void replicationDiscardCachedMaster(void) {
+    redisAssert(server.cached_master != NULL);
+
+    server.cached_master->flags &= ~REDIS_MASTER;
+    freeClient(server.cached_master);
+    server.cached_master = NULL;
+}
+
+void replicationResurrectCachedMaster(int newfd) {
+    /* Update last interaction time.
+     * Remove any wrong flag in the client structure like CLOSE_ASAP
+     * or CLOSE_AFTER_REPLY.
+     * ... */
 }
 
 /* --------------------------- REPLICATION CRON  ---------------------------- */
