@@ -739,7 +739,7 @@ struct redisServer {
     char *repl_backlog;             /* Replication backlog for partial syncs */
     long long repl_backlog_size;    /* Backlog circular buffer size */
     long long repl_backlog_histlen; /* Backlog actual data length */
-    long long repl_backlog_idx;     /* Backlog circualr buffer current offset */
+    long long repl_backlog_idx;     /* Backlog circular buffer current offset */
     long long repl_backlog_off;     /* Replication offset of first byte in the
                                        backlog buffer. */
     /* Replication (slave) */

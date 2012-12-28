@@ -92,7 +92,7 @@ void feedReplicationBacklogWithObject(robj *o) {
     void *p;
     size_t len;
 
-    if (o->encoding == REDIS_ENCODING_RAW) {
+    if (o->encoding == REDIS_ENCODING_INT) {
         len = ll2string(llstr,sizeof(llstr),(long)o->ptr);
         p = llstr;
     } else {
@@ -292,11 +292,42 @@ void replicationFeedMonitors(redisClient *c, list *monitors, int dictid, robj **
     decrRefCount(cmdobj);
 }
 
+/* Feed the slave 'c' with the replication backlog starting from the
+ * specified 'offset' up to the end of the backlog. */
+void addReplyReplicationBacklog(redisClient *c, long long offset) {
+    long long j, skip, len;
+
+    /* Compute the amount of bytes we need to discard. */
+    skip = offset - server.repl_backlog_off;
+
+    /* Point j to the oldest byte, that is actaully our
+     * server.repl_backlog_off byte. */
+    j = (server.repl_backlog_idx +
+        (server.repl_backlog_size-server.repl_backlog_histlen)) %
+        server.repl_backlog_size;
+
+    /* Discard the amount of data to seek to the specified 'offset'. */
+    j = (j + skip) % server.repl_backlog_size;
+
+    /* Feed slave with data. Since it is a circular buffer we have to
+     * split the reply in two parts if we are cross-boundary. */
+    len = server.repl_backlog_histlen - skip;
+    while(len) {
+        long long thislen =
+            ((server.repl_backlog_size - j) < len) ?
+            (server.repl_backlog_size - j) : len;
+
+        addReplySds(c,sdsnewlen(server.repl_backlog + j, thislen));
+        len -= thislen;
+        j = 0;
+    }
+}
+
 /* Try a partial resynchronization. On success return REDIS_OK, otherwise
  * REDIS_ERR is returned and we proceed with the usual full resync. */
 int tryPartialResynchronization(redisClient *c) {
     long long psync_offset;
-    robj *master_runid = c->argv[2];
+    robj *master_runid = c->argv[1];
 
     /* Is the runid of this master the same advertised by the wannabe slave
      * via PSYNC? If runid changed this master is a different instance and
@@ -316,6 +347,8 @@ int tryPartialResynchronization(redisClient *c) {
     c->flags |= REDIS_SLAVE;
     c->replstate = REDIS_REPL_ONLINE;
     listAddNodeTail(server.slaves,c);
+    addReplySds(c,sdsnew("+CONTINUE\r\n"));
+    addReplyReplicationBacklog(c,psync_offset);
     /* Note that we don't need to set the selected DB at server.slaveseldb
      * to -1 to force the master to emit SELECT, since the slave already
      * has this state from the previous connection with the master. */
@@ -324,6 +357,10 @@ int tryPartialResynchronization(redisClient *c) {
 
 need_full_resync:
     /* We need a full resync for some reason... notify the client. */
+    psync_offset = server.master_repl_offset;
+    /* Add 1 to psync_offset if it the replication backlog does not exists
+     * as when it will be created later we'll increment the offset by one. */
+    if (server.repl_backlog == NULL) psync_offset++;
     addReplySds(c,
         sdscatprintf(sdsempty(),"+FULLRESYNC %s %lld\r\n",
         server.runid,
