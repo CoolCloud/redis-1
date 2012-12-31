@@ -323,9 +323,12 @@ void addReplyReplicationBacklog(redisClient *c, long long offset) {
     }
 }
 
-/* Try a partial resynchronization. On success return REDIS_OK, otherwise
- * REDIS_ERR is returned and we proceed with the usual full resync. */
-int tryPartialResynchronization(redisClient *c) {
+/* This function handles the PSYNC command from the point of view of a
+ * master receiving a request for partial resynchronization.
+ *
+ * On success return REDIS_OK, otherwise REDIS_ERR is returned and we proceed
+ * with the usual full resync. */
+int masterTryPartialResynchronization(redisClient *c) {
     long long psync_offset;
     robj *master_runid = c->argv[1];
 
@@ -393,14 +396,15 @@ void syncCommand(redisClient *c) {
 
     /* Try a partial resynchronization if this is a PSYNC command.
      * If it fails, we continue with usual full resynchronization, however
-     * when this happens tryPartialResynchronization() already replied with:
+     * when this happens masterTryPartialResynchronization() already
+     * replied with:
      *
      * +FULLRESYNC <runid> <offset>
      *
      * So the slave knows the new runid and offset to try a PSYNC later
      * if the connection with the master is lost. */
     if (!strcasecmp(c->argv[0]->ptr,"psync") &&
-        tryPartialResynchronization(c) == REDIS_OK) return;
+        masterTryPartialResynchronization(c) == REDIS_OK) return;
 
     /* Here we need to check if there is a background saving operation
      * in progress, or if it is required to start one */
@@ -783,6 +787,32 @@ char *sendSynchronousCommand(int fd, ...) {
     return NULL; /* No errors. */
 }
 
+/* Try a partial resynchronization with the master if we are about to reconnect.
+ *
+ * On success REDIS_OK is returned, and the server.cahed_master is reused
+ * as a master.
+ *
+ * On failure REDIS_ERR is returned and the synchronization should continue
+ * using the SYNC command.
+ *
+ * This function is designed to be called from syncWithMaster(), so the
+ * following assumptions are made:
+ *
+ * 1) We pass the function an already connected socket "fd".
+ * 2) The master already replied to the PING command, so we can use blocking
+ *    I/O and assume it is unlikely that the master will disappear or will
+ *    not reply in a short time.
+ * 3) This function does not close the file descriptor "fd" if PSYNC fails
+ *    and REDIS_ERR is returned. If the PSYNC works as expected the function
+ *    uses 'fd' as file descriptor of the server.master client structure.
+ */
+int slaveTryPartialResynchronization(void) {
+    server.master = createClient(server.repl_transfer_s);
+    server.master->flags |= REDIS_MASTER;
+    server.master->authenticated = 1;
+    server.repl_state = REDIS_REPL_CONNECTED;
+}
+
 void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     char tmpfile[256], *err;
     int dfd, maxtries = 5;
@@ -878,6 +908,13 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         if (err) {
             redisLog(REDIS_NOTICE,"(non critical): Master does not understand REPLCONF listening-port: %s", err);
             sdsfree(err);
+        }
+    }
+
+    /* Try PSYNC if it is possible. */
+    if (server.cached_master) {
+        if (slaveTryPartialResynchronization() == REDIS_OK) {
+            redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Master accepted a Partial Resynchronization.");
         }
     }
 
