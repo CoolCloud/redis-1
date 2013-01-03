@@ -744,8 +744,8 @@ error:
 /* Send a synchronous command to the master. Used to send AUTH and
  * REPLCONF commands before starting the replication with SYNC.
  *
- * On success NULL is returned.
- * On error an sds string describing the error is returned.
+ * The command returns an sds string representing the result of the
+ * operation. On error the first byte is a "-".
  */
 char *sendSynchronousCommand(int fd, ...) {
     va_list ap;
@@ -767,7 +767,7 @@ char *sendSynchronousCommand(int fd, ...) {
     /* Transfer command to the server. */
     if (syncWrite(fd,cmd,sdslen(cmd),server.repl_syncio_timeout*1000) == -1) {
         sdsfree(cmd);
-        return sdscatprintf(sdsempty(),"Writing to master: %s",
+        return sdscatprintf(sdsempty(),"-Writing to master: %s",
                 strerror(errno));
     }
     sdsfree(cmd);
@@ -775,42 +775,94 @@ char *sendSynchronousCommand(int fd, ...) {
     /* Read the reply from the server. */
     if (syncReadLine(fd,buf,sizeof(buf),server.repl_syncio_timeout*1000) == -1)
     {
-        return sdscatprintf(sdsempty(),"Reading from master: %s",
+        return sdscatprintf(sdsempty(),"-Reading from master: %s",
                 strerror(errno));
     }
 
     /* Check for errors from the server. */
-    if (buf[0] != '+') {
-        return sdscatprintf(sdsempty(),"Error from master: %s", buf);
-    }
-
-    return NULL; /* No errors. */
+    return sdscatprintf(sdsnew(buf));
 }
 
 /* Try a partial resynchronization with the master if we are about to reconnect.
- *
- * On success REDIS_OK is returned, and the server.cahed_master is reused
- * as a master.
- *
- * On failure REDIS_ERR is returned and the synchronization should continue
- * using the SYNC command.
+ * If there is no cached master structure, at least try to issue a
+ * "PSYNC ? -1" command in order to trigger a full resync using the PSYNC
+ * command in order to obtain the master run id and the master replication
+ * global offset.
  *
  * This function is designed to be called from syncWithMaster(), so the
  * following assumptions are made:
  *
  * 1) We pass the function an already connected socket "fd".
- * 2) The master already replied to the PING command, so we can use blocking
- *    I/O and assume it is unlikely that the master will disappear or will
- *    not reply in a short time.
- * 3) This function does not close the file descriptor "fd" if PSYNC fails
- *    and REDIS_ERR is returned. If the PSYNC works as expected the function
- *    uses 'fd' as file descriptor of the server.master client structure.
+ * 2) This function does not close the file descriptor "fd". However in case
+ *    of successful partial resynchronization, the function will reuse
+ *    'fd' as file descriptor of the server.master client structure.
+ *
+ * The function returns:
+ *
+ * PSYNC_CONTINUE: If the PSYNC command succeded and we can continue.
+ * PSYNC_FULLRESYNC: If PSYNC is supported but a full resync is needed.
+ *                   In this case the master run_id and global replication
+ *                   offset is saved.
+ * PSYNC_NOT_SUPPORTED: If the server does not understand PSYNC at all and
+ *                      the caller should fall back to SYNC.
  */
-int slaveTryPartialResynchronization(void) {
-    server.master = createClient(server.repl_transfer_s);
-    server.master->flags |= REDIS_MASTER;
-    server.master->authenticated = 1;
-    server.repl_state = REDIS_REPL_CONNECTED;
+
+#define PSYNC_CONTINUE 0
+#define PSYNC_FULLRESYNC 1
+#define PSYNC_NOT_SUPPORTED 2
+int slaveTryPartialResynchronization(int fd) {
+    char *psync_runid;
+    char psync_offset[32];
+    sds *reply;
+
+    if (server.cached_master) {
+        redisLog(REDIS_NOTICE,"Trying a partial resynchronization...");
+        psync_runid = server.cached_master->master_run_id;
+        snprintf(psync_offset,sizeof(psync_offset),"%lld", server.reploff+1);
+    } else {
+        psync_runid = "?";
+        memcpy(psync_offset,"-1",3);
+    }
+
+    /* Issue the PSYNC command */
+    reply = sendSynchronousCommand(fd,"PSYNC",psync_runid,psync_offset,NULL);
+
+    if (!strncmp(reply,"-ERR",4)) {
+        /* -ERR, PSYNC not suppored or some other server error. */
+        sdsfree(reply);
+        server.repl_master_initial_offset = -1;
+        if (server.cached_master) replicationDiscardCachedMaster();
+        return PSYNC_NOT_SUPPORTED;
+    }
+
+    if (!strncmp(reply,"+FULLRESYNC",11)) {
+        char *runid, *offset;
+
+        /* FULL RESYNC, parse the reply in order to extract the run id
+         * and the replication offset. */
+        runid = strchr(reply,' ');
+        if (runid) offset = strchr(runid+1,' ');
+        if (!runid || !offset || (offset-runid-1) != REDIS_RUN_ID_SIZE) {
+            redisLog(REDIS_WARNING,
+                "Master replied with wrong +FULLRESYNC syntax.");
+            server.repl_master_initial_offset = -1;
+        } else {
+            memcpy(server.repl_master_run_id, runid, offset-runid-1);
+            server.repl_master_run_id[REDIS_RUN_ID_SIZE] = '\0';
+            server.repl_master_initial_offset = strtoll(offset,NULL,10);
+            redisLog(REDIS_NOTICE,"Master asks for full resync: %s:%lld",
+                server.repl_master_run_id,
+                server.repl_master_initial_offset);
+        }
+        /* We are going to full resync, discard the cached master structure. */
+        if (server.cached_master) replicationDiscardCachedMaster();
+        return PSYNC_FULLRESYNC;
+    }
+
+    if (!strncmp(reply,"+CONTINUE",9)) {
+        /* Partial resync was accepted, set the replication state accordingly */
+        replicationResurrectCachedMaster(fd);
+    }
 }
 
 void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -889,11 +941,12 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* AUTH with the master if required. */
     if(server.masterauth) {
         err = sendSynchronousCommand(fd,"AUTH",server.masterauth,NULL);
-        if (err) {
+        if (err[0] == '-') {
             redisLog(REDIS_WARNING,"Unable to AUTH to MASTER: %s",err);
             sdsfree(err);
             goto error;
         }
+        sdsfree(err);
     }
 
     /* Set the slave port, so that Master's INFO command can list the
@@ -905,24 +958,32 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         sdsfree(port);
         /* Ignore the error if any, not all the Redis versions support
          * REPLCONF listening-port. */
-        if (err) {
+        if (err[0] == '-') {
             redisLog(REDIS_NOTICE,"(non critical): Master does not understand REPLCONF listening-port: %s", err);
-            sdsfree(err);
         }
+        sdsfree(err);
     }
 
-    /* Try PSYNC if it is possible. */
-    if (server.cached_master) {
-        if (slaveTryPartialResynchronization() == REDIS_OK) {
-            redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Master accepted a Partial Resynchronization.");
-        }
+    /* Try a partial resynchonization. If we don't have a cached master
+     * slaveTryPartialResynchronization() will at least try to use PSYNC
+     * to start a full resynchronization so that we get the master run id
+     * and the global offset, to try a partial resync at the next
+     * reconnection attempt. */
+    psync_result = slaveTryPartialResynchronization(fd);
+    if (psync_result == PSYNC_CONTINUE) {
+        redisLog(REDIS_NOTICE, "MASTER <-> SLAVE sync: Master accepted a Partial Resynchronization.");
+        return;
     }
 
-    /* Issue the SYNC command */
-    if (syncWrite(fd,"SYNC\r\n",6,server.repl_syncio_timeout*1000) == -1) {
-        redisLog(REDIS_WARNING,"I/O error writing to MASTER: %s",
-            strerror(errno));
-        goto error;
+    /* Fall back to SYNC if needed. Otherwise psync_result == PSYNC_FULLRESYNC
+     * and the server.repl_master_run_id and repl_master_initial_offset are
+     * already populated. */
+    if (psync_result == PSYNC_NOT_SUPPORTED) {
+        if (syncWrite(fd,"SYNC\r\n",6,server.repl_syncio_timeout*1000) == -1) {
+            redisLog(REDIS_WARNING,"I/O error writing to MASTER: %s",
+                strerror(errno));
+            goto error;
+        }
     }
 
     /* Prepare a suitable temp file for bulk transfer */
@@ -1082,6 +1143,13 @@ void replicationResurrectCachedMaster(int newfd) {
      * Remove any wrong flag in the client structure like CLOSE_ASAP
      * or CLOSE_AFTER_REPLY.
      * ... */
+
+    server.master = server.cached_master;
+    server.cached_master = NULL;
+    server.fd = newfd; /* We already have the readable handler installed. */
+    server.master->flags &= ~(REDIS_CLOSE_AFTER_REPLY|REDIS_CLOSE_ASAP);
+    server.master->authenticated = 1;
+    server.repl_state = REDIS_REPL_CONNECTED;
 }
 
 /* --------------------------- REPLICATION CRON  ---------------------------- */

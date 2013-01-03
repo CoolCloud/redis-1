@@ -1199,6 +1199,7 @@ void initServerConfig() {
     server.masterport = 6379;
     server.master = NULL;
     server.cached_master = NULL;
+    server.repl_master_initial_offset = -1;
     server.repl_state = REDIS_REPL_NONE;
     server.repl_syncio_timeout = REDIS_REPL_SYNCIO_TIMEOUT;
     server.repl_serve_stale_data = 1;

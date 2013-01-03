@@ -762,6 +762,8 @@ struct redisServer {
     int repl_slave_ro;          /* Slave is read only? */
     time_t repl_down_since; /* Unix time at which link with master went down */
     int slave_priority;             /* Reported in INFO and used by Sentinel. */
+    char repl_master_runid[REDIS_RUN_ID_SIZE+1];  /* Master run id for PSYNC. */
+    long long repl_master_initial_offset;         /* Master PSYNC offset. */
     /* Limits */
     unsigned int maxclients;        /* Max number of simultaneous clients */
     unsigned long long maxmemory;   /* Max number of memory bytes to use */
