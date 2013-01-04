@@ -406,6 +406,7 @@ typedef struct redisClient {
     long repldboff;         /* replication DB file offset */
     off_t repldbsize;       /* replication DB file size */
     long long reploff;      /* replication offset if this is our master */
+    char replrunid[REDIS_RUN_ID_SIZE+1]; /* master run id if this is a master */
     int slave_listening_port; /* As configured with: SLAVECONF listening-port */
     multiState mstate;      /* MULTI/EXEC state */
     blockingState bpop;   /* blocking state */
